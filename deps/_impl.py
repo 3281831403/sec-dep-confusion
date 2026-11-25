@@ -12,7 +12,6 @@ The module works with three plain data structures:
 from __future__ import annotations
 
 import re
-from urllib.parse import urlsplit
 
 __all__ = [
     "parse_requirement",
@@ -83,20 +82,30 @@ def _name_in_prefix(name, prefix):
 
 
 def _has_internal_namespace(name, policy):
+    # Match on dot-separated segments: the package name must equal the
+    # prefix or extend it with further segments.  A plain string prefix
+    # test would wrongly accept e.g. "corp.payments" for prefix "corp.pay".
     prefixes = (policy or {}).get("internal_prefixes") or []
-    namespace = namespace_of(name).lower()
-    for prefix in prefixes:
-        if namespace.startswith(str(prefix).strip().lower()):
-            return True
-    return False
+    return any(_name_in_prefix(name, prefix) for prefix in prefixes)
+
+
+def _source_url(source):
+    """Return the URL for a source given as a string or a source mapping."""
+    if isinstance(source, dict):
+        return str(source.get("url") or "").strip()
+    return str(source or "").strip()
 
 
 def _is_internal_source(source, policy):
+    # Exact address match only.  Hostname suffix matching would accept
+    # look-alikes such as "https://evilcorp.example/simple" for the allowed
+    # "https://corp.example/simple", and would ignore scheme/path entirely.
     allowed = (policy or {}).get("internal_sources") or []
-    host = (urlsplit(str(source)).hostname or "").lower()
+    candidate = _source_url(source)
+    if not candidate:
+        return False
     for entry in allowed:
-        allowed_host = (urlsplit(str(entry)).hostname or "").lower()
-        if allowed_host and host.endswith(allowed_host):
+        if candidate == str(entry).strip():
             return True
     return False
 
@@ -110,12 +119,34 @@ def source_allowed(name, source, policy):
     return _is_internal_source(source, policy)
 
 
+_VERSION_TOKEN_RE = re.compile(r"\d+|[A-Za-z]+")
+
+
+def _version_key(version):
+    """Build a total-order key that compares numeric runs as integers.
+
+    Plain lexicographic comparison would order ``1.10.0`` below ``1.9.0``.
+    Each token is tagged with its type so int and str values are never
+    compared against each other, keeping the key total for arbitrary input.
+    """
+    tokens = _VERSION_TOKEN_RE.findall(str(version))
+    key = []
+    for token in tokens:
+        if token.isdigit():
+            key.append((1, int(token)))
+        else:
+            key.append((0, token.lower()))
+    if not key:
+        key.append((1, 0))
+    return tuple(key)
+
+
 def _compare_versions(left, right):
-    left_text = str(left)
-    right_text = str(right)
-    if left_text == right_text:
+    left_key = _version_key(left)
+    right_key = _version_key(right)
+    if left_key == right_key:
         return 0
-    return -1 if left_text < right_text else 1
+    return -1 if left_key < right_key else 1
 
 
 def _satisfies(version, spec):
@@ -161,9 +192,16 @@ def _best_version(versions, spec):
 
 
 def _ordered_sources(sources):
+    # Internal sources first, then a stable URL order.  The final repr
+    # tie-break makes the ordering total even for equal-URL entries, so the
+    # conclusion never depends on the caller's source-list order.
     return sorted(
-        sources or [],
-        key=lambda item: (0 if item.get("internal") else 1, str(item.get("url") or "")),
+        list(sources or []),
+        key=lambda item: (
+            0 if item.get("internal") else 1,
+            str(item.get("url") or ""),
+            repr(item),
+        ),
     )
 
 
@@ -183,10 +221,29 @@ def _internal_prefixes(sources):
     return prefixes
 
 
-def resolve(requirements, sources, lockfile):
+def _source_matches_policy(source, policy):
+    """Whether an internal-flagged source is also allowed by ``policy``.
+
+    When the policy pins an explicit ``internal_sources`` address list it
+    must match exactly; otherwise the source's own ``internal`` marker is
+    authoritative.
+    """
+    if not source.get("internal"):
+        return False
+    allowed = (policy or {}).get("internal_sources")
+    if allowed:
+        return _is_internal_source(source.get("url"), policy)
+    return True
+
+
+def resolve(requirements, sources, lockfile, policy=None):
     """Resolve requirements, preferring locked versions and internal sources."""
     ordered = _ordered_sources(sources)
     prefixes = _internal_prefixes(ordered)
+    for prefix in (policy or {}).get("internal_prefixes") or []:
+        if prefix not in prefixes:
+            prefixes.append(prefix)
+
     locks = {}
     for name, version in (lockfile or {}).items():
         locks[_normalize_name(name)] = str(version)
@@ -203,28 +260,39 @@ def resolve(requirements, sources, lockfile):
         spec = parsed.get("spec") or "*"
         internal = any(_name_in_prefix(name, prefix) for prefix in prefixes)
 
+        # A lockfile is an exact pin and takes precedence over a floating
+        # version range.
         locked = locks.get(_normalize_name(name))
-        if locked is not None and spec in ("", "*"):
-            target = locked
-        else:
-            target = None
+        target = str(locked) if locked is not None else None
 
-        candidate_sources = [
-            source for source in ordered if not internal or source.get("internal")
-        ]
+        # Internal names may only be served by internal sources.  There is
+        # deliberately no fallback to public sources, even when the internal
+        # index does not carry the requested version.
+        if internal:
+            candidate_sources = [
+                source
+                for source in ordered
+                if _source_matches_policy(source, policy)
+            ]
+        else:
+            candidate_sources = list(ordered)
+
         available = []
         for source in candidate_sources:
             versions = _source_versions(source, name)
             if versions:
                 available.append((source, versions))
 
-        if internal and not available:
-            for source in ordered:
-                if source.get("internal"):
-                    continue
-                versions = _source_versions(source, name)
-                if versions:
-                    available.append((source, versions))
+        # Same-named packages on disallowed/public sources are dependency
+        # confusion shadows.  They are never selected, but recorded so the
+        # failure can be reported with the offending addresses.
+        allowed_ids = {id(source) for source in candidate_sources}
+        shadow_sources = [
+            source
+            for source in ordered
+            if id(source) not in allowed_ids and _source_versions(source, name)
+        ]
+        shadow_urls = [str(source.get("url")) for source in shadow_sources]
 
         if target is None:
             all_versions = []
@@ -233,12 +301,15 @@ def resolve(requirements, sources, lockfile):
             target = _best_version(all_versions, spec)
 
         if target is None:
-            errors.append(
-                {
-                    "name": name,
-                    "reason": "no available version satisfies %s" % spec,
-                }
-            )
+            reason = "no available version satisfies %s" % spec
+            if internal and shadow_urls:
+                reason += (
+                    "; internal package must be resolved from an internal "
+                    "source; same-name package on public source(s) was "
+                    "rejected as a dependency-confusion shadow: %s"
+                    % ", ".join(shadow_urls)
+                )
+            errors.append({"name": name, "reason": reason})
             continue
 
         chosen = None
@@ -248,12 +319,13 @@ def resolve(requirements, sources, lockfile):
                 break
 
         if chosen is None:
-            errors.append(
-                {
-                    "name": name,
-                    "reason": "version %s is not available from an allowed source" % target,
-                }
-            )
+            reason = "version %s is not available from an allowed source" % target
+            if internal and shadow_urls:
+                reason += (
+                    "; same-name package on public source(s) was rejected as "
+                    "a dependency-confusion shadow: %s" % ", ".join(shadow_urls)
+                )
+            errors.append({"name": name, "reason": reason})
             continue
 
         packages[name] = {
@@ -266,9 +338,28 @@ def resolve(requirements, sources, lockfile):
 
 
 def detect_shadowing(requirements, public_index):
-    """Report requirements whose package name also exists on the public index."""
+    """Report requirements whose package name also exists on the public index.
+
+    Name comparison follows normalized package-name identity
+    (case-/separator-insensitive).  A finding is emitted for every public
+    version published under a matching name, regardless of whether the
+    requirement's pin happens to equal that version: a higher or lower
+    public version is still a squatter occupying the same namespace.
+    """
     findings = []
-    index = dict(public_index or {})
+
+    entries = []
+    for public_name, public_value in (public_index or {}).items():
+        if isinstance(public_value, (list, tuple, set, frozenset)):
+            public_versions = [str(version) for version in public_value]
+            public_versions.sort(key=lambda value: (_version_key(value), value))
+        else:
+            public_versions = [str(public_value)]
+        entries.append(
+            (_normalize_name(public_name), str(public_name), public_versions)
+        )
+    entries.sort(key=lambda entry: (entry[0], entry[1]))
+
     for requirement in requirements or []:
         parsed = (
             parse_requirement(requirement)
@@ -276,24 +367,20 @@ def detect_shadowing(requirements, public_index):
             else dict(requirement)
         )
         name = parsed.get("name") or ""
-        spec = parsed.get("spec") or "*"
-        pinned = None
-        if isinstance(spec, str) and spec.startswith("=="):
-            pinned = spec[2:].strip()
+        target_name = _normalize_name(name)
 
-        for public_name, public_version in index.items():
-            if name != public_name:
+        for _normalized, public_name, public_versions in entries:
+            if target_name != _normalized:
                 continue
-            if pinned != str(public_version):
-                continue
-            findings.append(
-                {
-                    "name": public_name,
-                    "version": str(public_version),
-                    "requirement": name,
-                    "reason": "same package name is published on the public index",
-                }
-            )
+            for public_version in public_versions:
+                findings.append(
+                    {
+                        "name": public_name,
+                        "version": public_version,
+                        "requirement": name,
+                        "reason": "same package name is published on the public index",
+                    }
+                )
     return findings
 
 
@@ -305,6 +392,11 @@ def validate_policy(policy):
         problems.append("no internal namespace prefixes are configured")
     if not policy.get("lockfile"):
         problems.append("no lockfile is configured")
+    if policy.get("allow_public_fallback"):
+        problems.append(
+            "public fallback is enabled; internal packages must resolve only "
+            "from internal sources (allow_public_fallback must be false)"
+        )
     return problems
 
 
@@ -313,30 +405,34 @@ def record_provenance(resolved):
     packages = (resolved or {}).get("packages") or {}
     provenance = {}
     for name, entry in packages.items():
+        entry = entry or {}
+        final = entry.get("source")
         history = [str(item) for item in entry.get("sources") or []]
-        if not history and entry.get("source"):
-            history = [str(entry["source"])]
+        if not history and final:
+            history = [str(final)]
         provenance[name] = {
-            "final": entry.get("source"),
-            "sources": history[-1:],
+            "final": final,
+            "sources": history,
         }
     return provenance
 
 
 def resolve_batch(sets, policy):
-    """Resolve several requirement sets and return one result per set."""
+    """Resolve several requirement sets and return one result per set.
+
+    Every set is resolved independently with its own requirements, sources
+    and lockfile; results are never shared or cached across sets.
+    """
     results = {}
-    shared = None
     for index, item in enumerate(sets or []):
         key = item.get("name") or "set-%d" % index
-        if shared is None:
-            lockfile = item.get("lockfile")
-            if lockfile is None:
-                lockfile = (policy or {}).get("lockfile") or {}
-            shared = resolve(
-                item.get("requirements") or [],
-                item.get("sources") or [],
-                lockfile,
-            )
-        results[key] = shared
+        lockfile = item.get("lockfile")
+        if lockfile is None:
+            lockfile = (policy or {}).get("lockfile") or {}
+        results[key] = resolve(
+            item.get("requirements") or [],
+            item.get("sources") or [],
+            lockfile,
+            policy,
+        )
     return results
